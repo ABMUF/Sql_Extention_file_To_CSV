@@ -5,7 +5,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import time
 
-def parse_sql_insert(sql_insert, all_dfs):
+def parse_sql_insert(sql_insert):
     if not re.match(r"(?i)^INSERT INTO", sql_insert):
         sql_insert = "INSERT INTO " + sql_insert
 
@@ -22,24 +22,21 @@ def parse_sql_insert(sql_insert, all_dfs):
     else:
         raise ValueError("Column names not found in SQL statement.")
 
-    values_match = re.search(r"VALUES\s*\(([^;]+)\);?", sql_insert)
-    if values_match:
-        values = values_match.group(1)
-    else:
-        raise ValueError("Values not found in SQL statement.")
+    values_match = re.findall(r"\(([^)]+)\)", sql_insert.split("VALUES", 1)[1])
+    rows = []
+    for value_group in values_match:
+        values = re.split(r",(?=(?:[^']*'[^']*')*[^']*$)", value_group)  # Handles commas within quotes
+        values = [v.strip().strip("'") for v in values]
+        rows.append(values)
 
-    values = re.split(r"\),\s*\(", values)
-    values = [re.split(r",", val) for val in values]
-    values = [[v.strip().strip("'") for v in val] for val in values]
+    if not rows:
+        raise ValueError("No rows found in SQL statement.")
 
-    df = pd.DataFrame(values, columns=column_names)
+    if len(column_names) != len(rows[0]):
+        raise ValueError(f"Column count does not match value count in statement: {sql_insert}")
 
-    if table_name in all_dfs:
-        all_dfs[table_name] = pd.concat([all_dfs[table_name], df], ignore_index=True)
-    else:
-        all_dfs[table_name] = df
-
-    return all_dfs
+    df = pd.DataFrame(rows, columns=column_names)
+    return table_name, df
 
 def write_to_csv(all_dfs, sql_file, folder_path):
     sql_filename = os.path.splitext(os.path.basename(sql_file))[0]
@@ -63,18 +60,21 @@ def process_sql_file(sql_file, folder_path):
         sql_content = file.read()
 
     all_dfs = {}
-    insert_statements = re.split(r"(?i)\);\s*INSERT INTO", sql_content)
+    insert_statements = re.split(r"(?i)\);?\s*INSERT INTO", sql_content)
+    insert_statements = ["INSERT INTO" + statement for statement in insert_statements if statement.strip()]
 
     total_statements = len(insert_statements)
     batch_size = 1000
     batch_counter = 0
 
     for i, statement in enumerate(insert_statements):
-        if not re.match(r"(?i)^INSERT INTO", statement):
-            statement = "INSERT INTO" + statement
-
         try:
-            all_dfs = parse_sql_insert(statement, all_dfs)
+            table_name, df = parse_sql_insert(statement)
+            if table_name in all_dfs:
+                all_dfs[table_name] = pd.concat([all_dfs[table_name], df], ignore_index=True)
+            else:
+                all_dfs[table_name] = df
+
             batch_counter += 1
 
             if batch_counter >= batch_size:
