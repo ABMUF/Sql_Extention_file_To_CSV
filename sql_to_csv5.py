@@ -1,107 +1,121 @@
 import os
 import re
 import pandas as pd
-from multiprocessing import Pool, cpu_count
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+import time
 
-def parse_sql_insert(statement):
-    # Example parsing function; adjust based on your SQL statement structure
-    # This function assumes the statement starts with "INSERT INTO"
-    table_name = re.search(r"INSERT INTO\s+(\w+)\s+", statement, re.IGNORECASE).group(1)
-    values_match = re.search(r"VALUES\s+\((.*)\)", statement, re.IGNORECASE)
+def parse_sql_insert(sql_insert, all_dfs):
+    if not re.match(r"(?i)^INSERT INTO", sql_insert):
+        sql_insert = "INSERT INTO " + sql_insert
+
+    table_name_match = re.search(r"(?i)INSERT INTO\s+`?([^`\s]+)`?\s*\(", sql_insert)
+    if table_name_match:
+        table_name = table_name_match.group(1)
+    else:
+        raise ValueError("Table name not found in SQL statement.")
+
+    column_names_match = re.search(r"\(([^)]+)\)\s*VALUES", sql_insert)
+    if column_names_match:
+        column_names = column_names_match.group(1).replace('`', '').split(',')
+        column_names = [name.strip() for name in column_names]
+    else:
+        raise ValueError("Column names not found in SQL statement.")
+
+    values_match = re.search(r"VALUES\s*\(([^;]+)\);?", sql_insert)
     if values_match:
         values = values_match.group(1)
-        # Simulated parsing, assuming values are comma-separated
-        rows = [tuple(val.strip() for val in values.split(','))]
-        column_names = ["col1", "col2", "col3"]  # Example column names
-        df = pd.DataFrame(rows, columns=column_names)
-        return table_name, df
     else:
-        raise ValueError("Could not parse VALUES from SQL statement")
+        raise ValueError("Values not found in SQL statement.")
 
-def process_batch(batch_info):
-    batch, sql_file, folder_path = batch_info
-    all_dfs = {}
-    errors = []
+    values = re.split(r"\),\s*\(", values)
+    values = [re.split(r",", val) for val in values]
+    values = [[v.strip().strip("'") for v in val] for val in values]
 
-    for statement in batch:
-        try:
-            table_name, df = parse_sql_insert(statement)
-            if table_name in all_dfs:
-                all_dfs[table_name] = pd.concat([all_dfs[table_name], df], ignore_index=True)
-            else:
-                all_dfs[table_name] = df
-        except Exception as e:
-            errors.append(f"Error processing statement:\n{statement}\nError: {e}\n\n")
-            continue
+    df = pd.DataFrame(values, columns=column_names)
 
+    if table_name in all_dfs:
+        all_dfs[table_name] = pd.concat([all_dfs[table_name], df], ignore_index=True)
+    else:
+        all_dfs[table_name] = df
+
+    return all_dfs
+
+def write_to_csv(all_dfs, sql_file, folder_path):
     sql_filename = os.path.splitext(os.path.basename(sql_file))[0]
 
     for table_name, df in all_dfs.items():
         csv_filename = os.path.join(folder_path, f"{sql_filename}_{table_name}.csv")
-        try:
-            if os.path.exists(csv_filename):
-                df.to_csv(csv_filename, mode='a', index=False, header=False, encoding='utf-8')
-            else:
-                df.to_csv(csv_filename, mode='w', index=False, encoding='utf-8')
-            print(f"Saved {len(df)} rows from {table_name} table to {csv_filename}")
-        except Exception as e:
-            errors.append(f"Error writing to CSV for table {table_name}:\n{e}\n\n")
-            continue
+        if os.path.exists(csv_filename):
+            df.to_csv(csv_filename, mode='a', header=False, index=False)
+        else:
+            df.to_csv(csv_filename, mode='w', header=True, index=False)
+        print(f"Saved {len(df)} rows from {table_name} table to {csv_filename}")
 
-    # Log errors
-    if errors:
-        error_log_file = os.path.join(folder_path, "errors.log")
-        with open(error_log_file, "a", encoding='utf-8') as error_file:
-            error_file.write("\n".join(errors))
+def extract_id(statement):
+    id_match = re.search(r"VALUES\s*\(\s*([^,]+)", statement)
+    if id_match:
+        return id_match.group(1).strip().strip("'")
+    return None
 
-    # Free memory
-    del all_dfs
-    import gc
-    gc.collect()
-
-    return len(batch), len(errors)
-
-def process_sql_file(sql_file, folder_path, batch_size):
-    print(f"Processing SQL file: {sql_file}")
-    print(f"Output folder: {folder_path}")
-
+def process_sql_file(sql_file, folder_path):
     with open(sql_file, 'r', encoding='utf-8') as file:
         sql_content = file.read()
 
-    insert_statements = re.split(r"(?i)\);?\s*INSERT INTO", sql_content)
-    insert_statements = ["INSERT INTO" + statement for statement in insert_statements if statement.strip()]
+    all_dfs = {}
+    insert_statements = re.split(r"(?i)\);\s*INSERT INTO", sql_content)
 
     total_statements = len(insert_statements)
-    batches = [insert_statements[i:i + batch_size] for i in range(0, total_statements, batch_size)]
-
-    print(f"Suggested batch size: {batch_size}")
-    print(f"Processing {total_statements} statements in {len(batches)} batches...")
-
-    total_processed = 0
-    total_errors = 0
-
-    with Pool(processes=cpu_count()) as pool:
-        results = list(tqdm(pool.imap_unordered(process_batch, [(batch, sql_file, folder_path) for batch in batches]), total=len(batches), desc="Processing batches"))
-
-    for processed, errors in results:
-        total_processed += processed
-        total_errors += errors
-
-    print(f"Total statements processed: {total_processed}")
-    print(f"Total errors encountered: {total_errors}")
-
-    return total_processed
-
-def main():
-    sql_file = "SQL/Sessions.sql"
-    folder_path = "output"
     batch_size = 1000
+    batch_counter = 0
 
-    total_processed = process_sql_file(sql_file, folder_path, batch_size)
+    for i, statement in enumerate(insert_statements):
+        if not re.match(r"(?i)^INSERT INTO", statement):
+            statement = "INSERT INTO" + statement
 
-    print(f"Processing completed for SQL file: {sql_file}")
-    print(f"Total statements processed: {total_processed}")
+        try:
+            all_dfs = parse_sql_insert(statement, all_dfs)
+            batch_counter += 1
+
+            if batch_counter >= batch_size:
+                write_to_csv(all_dfs, sql_file, folder_path)
+                all_dfs.clear()
+                batch_counter = 0
+
+        except Exception as e:
+            print(f"Error processing statement {i+1} in file {sql_file}: {str(e)}")
+            with open(os.path.join(folder_path, "errors.log"), "a", encoding='utf-8') as error_file:
+                error_file.write(f"Error processing statement {i+1} in file {sql_file}:\n{statement}\nError: {e}\n\n")
+            if i > 0 and i < len(insert_statements) - 1:
+                prev_statement = insert_statements[i - 1]
+                next_statement = insert_statements[i + 1]
+
+                prev_id = extract_id(prev_statement)
+                next_id = extract_id(next_statement)
+
+                print(f"ID before error: {prev_id}")
+                print(f"ID after error: {next_id}")
+
+        print(f"Processed {i+1}/{total_statements} statements ({(i+1)/total_statements*100:.2f}%) in file {sql_file}")
+
+    if all_dfs:
+        write_to_csv(all_dfs, sql_file, folder_path)
+
+def process_sql_files_in_parallel(folder_path, num_workers=4):
+    sql_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.sql')]
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_sql_file, sql_file, folder_path) for sql_file in sql_files]
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing SQL files"):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error processing file in parallel: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    folder_path = "SQL/"
+    start_time = time.time()
+    process_sql_files_in_parallel(folder_path, num_workers=os.cpu_count())
+    end_time = time.time()
+    print(f"Finished processing all SQL files in {end_time - start_time:.2f} seconds")
